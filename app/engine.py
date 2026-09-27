@@ -3,6 +3,9 @@
 将经纬度投影到以围栏质心为原点的局部平面坐标系（等距圆柱近似），
 在米制坐标下用 Shapely 做距离计算，配合进入/离开缓冲距离形成迟滞区间，
 再叠加停留时长（dwell）做抖动去抖，产出 enter / leave / stay 事件。
+
+另含容量核算：由 enter/leave 事件还原设备半开在场区间，结合容量规则
+把查询窗口切分为状态恒定的占用分段并标注超限明细。
 """
 from __future__ import annotations
 
@@ -123,3 +126,96 @@ def compute_events(
             stay_emitted = True
 
     return events, inside, state_since
+
+
+# ---------- 容量核算 ----------
+
+
+@dataclass
+class OccupancySegment:
+    """[start, end) 内状态恒定（在场设备集合与生效上限均不变）的占用分段。"""
+
+    start: float
+    end: float
+    devices: tuple[str, ...]   # 在场设备 ID，已排序
+    limit: int | None          # 该分段生效的容量上限；无规则时为 None
+
+    @property
+    def count(self) -> int:
+        return len(self.devices)
+
+    @property
+    def exceeded(self) -> bool:
+        return self.limit is not None and self.count > self.limit
+
+    @property
+    def excess(self) -> int | None:
+        return self.count - self.limit if self.exceeded else None
+
+
+def compute_occupancy_segments(
+    events: list[tuple[str, str, float]],
+    rules: list[tuple[float, int]],
+    start: float,
+    end: float,
+) -> list[OccupancySegment]:
+    """由 enter/leave 事件与容量规则还原 [start, end) 内的占用分段。
+
+    - 重放事件流，把每台设备的在场时间还原为半开区间 [enter, leave)；
+      查询前已进入、查询结束仍未离开的区间被截断到查询窗口。
+    - 边界取窗口端点、区间端点与窗口内的规则生效时刻；同一时刻的
+      设备进出与规则切换在边界集合中天然合并，按一个原子边界处理。
+    - 相邻状态（在场设备集合 + 生效上限）相同的分段被合并，保证分段尽可能长。
+    """
+    # 1) 还原每台设备的半开在场区间 [enter, leave)
+    by_device: dict[str, list[tuple[float, str]]] = {}
+    for device_id, etype, ts in events:
+        if etype in (EVENT_ENTER, EVENT_LEAVE):
+            by_device.setdefault(device_id, []).append((ts, etype))
+
+    intervals: list[tuple[float, float, str]] = []  # (起, 止, 设备)
+    for device_id, evs in by_device.items():
+        evs.sort()
+        open_since: float | None = None
+        for ts, etype in evs:
+            if etype == EVENT_ENTER:
+                if open_since is None:
+                    open_since = ts
+            elif open_since is not None:
+                intervals.append((open_since, ts, device_id))
+                open_since = None
+        if open_since is not None:  # 仍未离开：延伸到 +inf，交由查询窗口截断
+            intervals.append((open_since, math.inf, device_id))
+
+    # 2) 截断到查询窗口 [start, end)，丢弃窗口外的零长区间
+    clipped = [
+        (max(s, start), min(e, end), dev)
+        for s, e, dev in intervals
+        if max(s, start) < min(e, end)
+    ]
+
+    # 3) 边界集合：同一时刻的进出与规则切换合并为一个原子边界
+    boundaries = {start, end}
+    for cs, ce, _ in clipped:
+        boundaries.add(cs)
+        boundaries.add(ce)
+    ordered_rules = sorted(rules)
+    for effective_from, _ in ordered_rules:
+        if start < effective_from < end:
+            boundaries.add(effective_from)
+    ordered = sorted(boundaries)
+
+    # 4) 逐段求恒定状态，相邻同状态分段合并
+    segments: list[OccupancySegment] = []
+    for a, b in zip(ordered, ordered[1:]):
+        devices = tuple(sorted(dev for cs, ce, dev in clipped if cs <= a < ce))
+        limit: int | None = None
+        for effective_from, cap in ordered_rules:
+            if effective_from > a:
+                break
+            limit = cap
+        if segments and segments[-1].devices == devices and segments[-1].limit == limit:
+            segments[-1].end = b
+        else:
+            segments.append(OccupancySegment(a, b, devices, limit))
+    return segments

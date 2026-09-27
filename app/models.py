@@ -49,3 +49,15 @@ class DeviceState(Base):
     fence_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     state: Mapped[str] = mapped_column(String(10))  # inside | outside
     since: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+class CapacityRule(Base):
+    __tablename__ = "capacity_rules"
+    # (fence_id, effective_from) 唯一：同一围栏同一生效时刻只允许一条容量规则
+    __table_args__ = (UniqueConstraint("fence_id", "effective_from", name="uq_fence_effective"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    fence_id: Mapped[int] = mapped_column(Integer, index=True)
+    effective_from: Mapped[float] = mapped_column(Float)  # epoch 秒，规则生效时刻（含）
+    max_occupancy: Mapped[int] = mapped_column(Integer)   # 容量上限，正整数
+    created_at: Mapped[float] = mapped_column(Float)

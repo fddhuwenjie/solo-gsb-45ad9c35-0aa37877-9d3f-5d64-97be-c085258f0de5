@@ -69,3 +69,33 @@ class FenceStateOut(BaseModel):
 class DeviceStatusOut(BaseModel):
     device_id: str
     fences: list[FenceStateOut]
+
+
+class CapacityRuleCreate(BaseModel):
+    effective_from: datetime = Field(description="规则生效时刻（ISO 8601，含该时刻）")
+    max_occupancy: int = Field(gt=0, description="容量上限（正整数）")
+
+
+class CapacityRuleOut(BaseModel):
+    id: int
+    fence_id: int
+    effective_from: datetime
+    max_occupancy: int
+    created_at: datetime
+
+
+class OccupancySegmentOut(BaseModel):
+    start: datetime
+    end: datetime
+    count: int = Field(description="分段内在场设备数")
+    limit: int | None = Field(description="分段内生效的容量上限；无规则时为 null")
+    exceeded: bool = Field(description="是否超限（count > limit）")
+    excess: int | None = Field(description="超额人数，仅超限分段有值")
+    devices: list[str] | None = Field(description="在场设备（按 ID 排序），仅超限分段有值")
+
+
+class OccupancyOut(BaseModel):
+    fence_id: int
+    start: datetime
+    end: datetime
+    segments: list[OccupancySegmentOut]

@@ -6,6 +6,7 @@
 - 批量提交轨迹点（设备 ID + 时间戳 + 经纬度），**乱序点按设备时间自动重排**
 - 边界抖动去抖：可配置的**进入/离开缓冲距离**（迟滞带）+ **停留时长**（dwell）
 - 产出 `enter` / `leave` / `stay` 事件；**重复提交轨迹点不会重复产出事件**（幂等）
+- **围栏容量核算**：按生效时刻维护正整数容量上限规则，查询任意 `[start, end)` 窗口的占用分段与超限明细
 - 按时间范围/设备/围栏/类型查询事件，查询设备当前状态
 
 ## 快速开始（Docker Compose 一键启动）
@@ -100,16 +101,62 @@ curl http://localhost:8000/devices/dev-001/status
 }
 ```
 
+### 5. 新增容量规则
+
+```bash
+curl -X POST http://localhost:8000/fences/1/capacity-rules \
+  -H 'Content-Type: application/json' \
+  -d '{"effective_from": "2026-09-22T08:00:00Z", "max_occupancy": 2}'
+```
+
+- `max_occupancy` 必须是**正整数**（否则 `422`）
+- 同一围栏同一 `effective_from` 重复提交返回 `409`
+- 某时刻生效的上限 = 生效时刻 ≤ 该时刻的最近一条规则；此前无规则则该时段不限容（`limit` 为 `null`）
+- 管理接口：`GET /fences/1/capacity-rules`（按生效时刻升序）、`DELETE /fences/1/capacity-rules/{rule_id}`
+
+### 6. 查询占用分段（容量核算）
+
+```bash
+curl 'http://localhost:8000/fences/1/occupancy?start=2026-09-22T08:00:00Z&end=2026-09-22T09:00:00Z'
+```
+
+返回示例：
+
+```json
+{
+  "fence_id": 1,
+  "start": "2026-09-22T08:00:00Z",
+  "end": "2026-09-22T09:00:00Z",
+  "segments": [
+    {"start": "2026-09-22T08:00:00Z", "end": "2026-09-22T08:10:00Z", "count": 1, "limit": 2, "exceeded": false, "excess": null, "devices": null},
+    {"start": "2026-09-22T08:10:00Z", "end": "2026-09-22T08:20:00Z", "count": 3, "limit": 2, "exceeded": true, "excess": 1, "devices": ["dev-001", "dev-002", "dev-003"]},
+    {"start": "2026-09-22T08:20:00Z", "end": "2026-09-22T09:00:00Z", "count": 2, "limit": 2, "exceeded": false, "excess": null, "devices": null}
+  ]
+}
+```
+
+**语义说明**：
+
+1. **在场区间还原**：由该围栏的 `enter`/`leave` 事件重放出每台设备的半开区间 `[enter, leave)`；查询开始前已进入、查询结束仍未离开的区间被正确截断到 `[start, end)`。
+2. **原子边界**：同一时刻的设备进/出与容量规则切换合并为一个边界，分段在该时刻一次性切换，不产生中间态或零长分段。
+3. **恒定状态分段**：分段内在场设备集合与生效上限均不变；相邻同状态分段已合并，返回尽可能长的分段。
+4. **超限明细**：`exceeded=true` 的分段给出 `limit`（上限）、`count`（实际人数）、`excess`（超额数）与按 ID 排序的 `devices`；其余分段 `excess`/`devices` 为 `null`。
+5. **重算一致**：占用在查询时由事件现算；补录乱序轨迹点触发事件重算后，再次查询即反映最新结果，不残留旧的占用或超限片段。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/fences` | 创建围栏（GeoJSON Polygon，支持孔洞，附判定配置） |
 | GET | `/fences` / `/fences/{id}` | 围栏列表 / 详情 |
-| DELETE | `/fences/{id}` | 删除围栏及其事件、状态 |
+| DELETE | `/fences/{id}` | 删除围栏及其事件、状态、容量规则 |
 | POST | `/points` | 批量提交轨迹点（乱序重排、重复幂等） |
 | GET | `/events` | 事件查询（device_id / fence_id / type / start / end / limit / offset） |
 | GET | `/devices/{device_id}/status` | 设备当前相对各围栏的状态 |
+| POST | `/fences/{id}/capacity-rules` | 新增容量规则（生效时刻 + 正整数上限，同时刻唯一） |
+| GET | `/fences/{id}/capacity-rules` | 容量规则列表（按生效时刻升序） |
+| DELETE | `/fences/{id}/capacity-rules/{rule_id}` | 删除容量规则 |
+| GET | `/fences/{id}/occupancy` | 查询 `[start, end)` 占用分段与超限明细（必填 start/end） |
 | GET | `/health` | 健康检查 |
 
 ## 围栏配置参数
@@ -139,11 +186,11 @@ uvicorn app.main:app --reload --port 8000   # 本地启动
 ```
 app/
   main.py      # FastAPI 路由与摄入/重算流程
-  engine.py    # 投影、缓冲迟滞 + dwell 状态机（事件判定核心）
-  models.py    # SQLAlchemy 模型（fences / points / events / device_state）
+  engine.py    # 投影、缓冲迟滞 + dwell 状态机（事件判定核心）与容量占用分段计算
+  models.py    # SQLAlchemy 模型（fences / points / events / device_state / capacity_rules）
   schemas.py   # Pydantic 请求/响应模型
   database.py  # SQLite 连接与会话
-tests/         # pytest 端到端测试（孔洞、乱序、幂等、抖动、停留、查询）
+tests/         # pytest 端到端测试（孔洞、乱序、幂等、抖动、停留、查询、容量核算）
 Dockerfile / docker-compose.yml
 ```
 
