@@ -69,3 +69,40 @@ class FenceStateOut(BaseModel):
 class DeviceStatusOut(BaseModel):
     device_id: str
     fences: list[FenceStateOut]
+
+
+class CapacityRuleCreate(BaseModel):
+    effective_from: datetime = Field(description="规则生效时刻（ISO 8601，缺省时区按 UTC 处理）")
+    capacity: int = Field(gt=0, description="容量上限（正整数）")
+
+
+class CapacityRuleOut(BaseModel):
+    id: int
+    fence_id: int
+    effective_from: datetime
+    capacity: int
+
+
+class OccupancySegmentOut(BaseModel):
+    start: datetime
+    end: datetime
+    capacity: int | None  # null 表示该时段无生效规则（不限容量）
+    occupancy: int
+    devices: list[str]  # 在场设备，按 ID 排序
+
+
+class CapacityViolationOut(BaseModel):
+    start: datetime
+    end: datetime
+    capacity: int
+    occupancy: int
+    excess: int
+    devices: list[str]  # 在场设备，按 ID 排序
+
+
+class OccupancyOut(BaseModel):
+    fence_id: int
+    start: datetime
+    end: datetime
+    segments: list[OccupancySegmentOut]
+    violations: list[CapacityViolationOut]

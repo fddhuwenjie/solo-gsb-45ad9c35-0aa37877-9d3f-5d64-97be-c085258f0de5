@@ -9,9 +9,20 @@ from shapely.geometry import shape
 from sqlalchemy.orm import Session
 
 from .database import engine, get_db
-from .engine import FenceConfig, ProjectedFence, TrackPoint, compute_events
-from .models import Base, DeviceState, Event, Fence, TrackPointRow
+from .engine import (
+    EVENT_ENTER,
+    EVENT_LEAVE,
+    FenceConfig,
+    ProjectedFence,
+    TrackPoint,
+    compute_events,
+    compute_occupancy,
+)
+from .models import Base, CapacityRule, DeviceState, Event, Fence, TrackPointRow
 from .schemas import (
+    CapacityRuleCreate,
+    CapacityRuleOut,
+    CapacityViolationOut,
     DeviceStatusOut,
     EventOut,
     FenceConfigSchema,
@@ -19,6 +30,8 @@ from .schemas import (
     FenceOut,
     FenceStateOut,
     IngestResult,
+    OccupancyOut,
+    OccupancySegmentOut,
     PointBatch,
 )
 
@@ -46,8 +59,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="轨迹围栏事件 API",
-    description="带孔多边形围栏 + 乱序轨迹重排 + 缓冲/停留去抖的 enter/leave/stay 事件服务",
-    version="1.0.0",
+    description="带孔多边形围栏 + 乱序轨迹重排 + 缓冲/停留去抖的 enter/leave/stay 事件服务，支持围栏容量核算",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -110,6 +123,15 @@ def fence_out(f: Fence) -> FenceOut:
     )
 
 
+def capacity_rule_out(r: CapacityRule) -> CapacityRuleOut:
+    return CapacityRuleOut(
+        id=r.id,
+        fence_id=r.fence_id,
+        effective_from=to_iso(r.effective_from),
+        capacity=r.capacity,
+    )
+
+
 # ---------- 围栏管理 ----------
 
 @app.post("/fences", response_model=FenceOut, status_code=201)
@@ -167,6 +189,7 @@ def delete_fence(fence_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="围栏不存在")
     db.query(Event).filter_by(fence_id=fence_id).delete()
     db.query(DeviceState).filter_by(fence_id=fence_id).delete()
+    db.query(CapacityRule).filter_by(fence_id=fence_id).delete()
     db.delete(fence)
     db.commit()
 
@@ -255,6 +278,125 @@ def device_status(device_id: str, db: Session = Depends(get_db)):
                 since=to_iso(s.since),
             )
             for s in sorted(states, key=lambda s: s.fence_id)
+        ],
+    )
+
+
+# ---------- 容量规则与占用核算 ----------
+
+@app.post("/fences/{fence_id}/capacity-rules", response_model=CapacityRuleOut, status_code=201)
+def create_capacity_rule(fence_id: int, body: CapacityRuleCreate, db: Session = Depends(get_db)):
+    """新增容量规则：自 effective_from 起围栏容量上限为 capacity（正整数）。
+
+    同一围栏同一生效时刻不得重复，重复提交返回 409。
+    """
+    if db.get(Fence, fence_id) is None:
+        raise HTTPException(status_code=404, detail="围栏不存在")
+    eff = to_epoch(body.effective_from)
+    exists = (
+        db.query(CapacityRule.id)
+        .filter_by(fence_id=fence_id, effective_from=eff)
+        .first()
+    )
+    if exists:
+        raise HTTPException(status_code=409, detail="同一围栏同一生效时刻的容量规则已存在")
+    rule = CapacityRule(fence_id=fence_id, effective_from=eff, capacity=body.capacity)
+    db.add(rule)
+    db.commit()
+    db.refresh(rule)
+    return capacity_rule_out(rule)
+
+
+@app.get("/fences/{fence_id}/capacity-rules", response_model=list[CapacityRuleOut])
+def list_capacity_rules(fence_id: int, db: Session = Depends(get_db)):
+    """按生效时刻升序列出围栏的容量规则。"""
+    if db.get(Fence, fence_id) is None:
+        raise HTTPException(status_code=404, detail="围栏不存在")
+    rules = (
+        db.query(CapacityRule)
+        .filter_by(fence_id=fence_id)
+        .order_by(CapacityRule.effective_from)
+        .all()
+    )
+    return [capacity_rule_out(r) for r in rules]
+
+
+@app.delete("/fences/{fence_id}/capacity-rules/{rule_id}", status_code=204)
+def delete_capacity_rule(fence_id: int, rule_id: int, db: Session = Depends(get_db)):
+    rule = db.get(CapacityRule, rule_id)
+    if rule is None or rule.fence_id != fence_id:
+        raise HTTPException(status_code=404, detail="容量规则不存在")
+    db.delete(rule)
+    db.commit()
+
+
+@app.get("/fences/{fence_id}/occupancy", response_model=OccupancyOut)
+def fence_occupancy(
+    fence_id: int,
+    start: datetime = Query(description="起始时间（ISO 8601，含）"),
+    end: datetime = Query(description="结束时间（ISO 8601，不含）"),
+    db: Session = Depends(get_db),
+):
+    """核算 [start, end) 内的容量占用。
+
+    从 enter/leave 事件还原每台设备的半开在场区间（窗口外部分自动截断），
+    设备进出与规则切换在同一时刻按一个边界原子处理，返回尽可能长的恒定状态
+    分段；超限分段附上限、实际人数、超额数与按 ID 排序的在场设备。
+    查询时基于当前事件实时计算，补录乱序轨迹点触发重算后结果即时反映。
+    """
+    if db.get(Fence, fence_id) is None:
+        raise HTTPException(status_code=404, detail="围栏不存在")
+    start_ts, end_ts = to_epoch(start), to_epoch(end)
+    if not start_ts < end_ts:
+        raise HTTPException(status_code=422, detail="start 必须早于 end")
+
+    events = [
+        (device_id, etype, ts)
+        for device_id, etype, ts in (
+            db.query(Event.device_id, Event.type, Event.ts)
+            .filter(
+                Event.fence_id == fence_id,
+                Event.type.in_([EVENT_ENTER, EVENT_LEAVE]),
+                Event.ts < end_ts,
+            )
+            .all()
+        )
+    ]
+    rules = [
+        (eff, cap)
+        for eff, cap in (
+            db.query(CapacityRule.effective_from, CapacityRule.capacity)
+            .filter(CapacityRule.fence_id == fence_id)
+            .all()
+        )
+    ]
+    segments = compute_occupancy(events, rules, start_ts, end_ts)
+
+    return OccupancyOut(
+        fence_id=fence_id,
+        start=to_iso(start_ts),
+        end=to_iso(end_ts),
+        segments=[
+            OccupancySegmentOut(
+                start=to_iso(s.start),
+                end=to_iso(s.end),
+                capacity=s.capacity,
+                occupancy=s.occupancy,
+                devices=list(s.devices),
+            )
+            for s in segments
+        ],
+        violations=[
+            CapacityViolationOut(
+                start=to_iso(s.start),
+                end=to_iso(s.end),
+                capacity=s.capacity,
+                occupancy=s.occupancy,
+                excess=s.excess,
+                devices=list(s.devices),
+            )
+            for s in segments
+            if s.excess > 0
         ],
     )
 

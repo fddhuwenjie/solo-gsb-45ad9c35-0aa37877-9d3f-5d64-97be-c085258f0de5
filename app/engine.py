@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import bisect
 import math
 from dataclasses import dataclass
 
@@ -123,3 +124,108 @@ def compute_events(
             stay_emitted = True
 
     return events, inside, state_since
+
+
+# ---------- 容量占用核算 ----------
+
+@dataclass
+class OccupancySegment:
+    """[start, end) 内（容量上限, 在场设备集合）均恒定的分段。"""
+
+    start: float
+    end: float
+    capacity: int | None      # 该时段生效的容量上限；None 表示无规则覆盖（不限）
+    devices: tuple[str, ...]  # 在场设备，按 ID 排序
+
+    @property
+    def occupancy(self) -> int:
+        return len(self.devices)
+
+    @property
+    def excess(self) -> int:
+        """超出上限的人数；无生效上限时恒为 0。"""
+        if self.capacity is None:
+            return 0
+        return max(0, len(self.devices) - self.capacity)
+
+
+def reconstruct_intervals(
+    events: list[tuple[str, str, float]], start: float, end: float
+) -> dict[str, list[tuple[float, float]]]:
+    """从 enter/leave 事件流还原每台设备在 [start, end) 内的半开在场区间。
+
+    events 为 (device_id, type, ts)，仅 enter/leave 参与（stay 不改变在场状态）。
+    半开语义：t 时刻 enter 的设备自 t 起在场，t 时刻 leave 的设备自 t 起不在场。
+    start 之前已进入的访问截断到 start；end 时仍未离开的访问截断到 end。
+    """
+    intervals: dict[str, list[tuple[float, float]]] = {}
+    open_since: dict[str, float] = {}
+    for device_id, etype, ts in sorted(events, key=lambda e: e[2]):
+        if ts >= end:
+            break  # 窗口外的事件不影响 [start, end)
+        if etype == EVENT_ENTER:
+            open_since[device_id] = ts
+        elif etype == EVENT_LEAVE:
+            enter_ts = open_since.pop(device_id, None)
+            if enter_ts is None:
+                continue  # 无配对 enter 的 leave，忽略
+            lo = max(enter_ts, start)  # 查询前已进入 -> 截断到 start
+            if lo < ts:
+                intervals.setdefault(device_id, []).append((lo, ts))
+    # 查询结束仍未离开 -> 截断到 end
+    for device_id, enter_ts in open_since.items():
+        lo = max(enter_ts, start)
+        if lo < end:
+            intervals.setdefault(device_id, []).append((lo, end))
+    return intervals
+
+
+def compute_occupancy(
+    events: list[tuple[str, str, float]],
+    rules: list[tuple[float, int]],
+    start: float,
+    end: float,
+) -> list[OccupancySegment]:
+    """计算围栏在 [start, end) 内的容量占用分段。
+
+    - events: (device_id, type, ts) 事件流（仅 enter/leave 参与）
+    - rules:  (effective_from, capacity) 容量规则；某时刻的上限取生效时刻不晚于
+      该时刻的最后一条规则，无规则覆盖时上限为 None（不限）
+    - 同一时刻的设备进出与规则切换按一个边界原子处理：半开语义下该时刻的
+      全部变化同时生效，不产生中间态或零长度分段
+    返回尽可能长的恒定状态分段（相邻分段的 (capacity, devices) 必不相同）。
+    """
+    intervals = reconstruct_intervals(events, start, end)
+
+    bounds = {start, end}
+    for ivs in intervals.values():
+        for lo, hi in ivs:
+            if start < lo < end:
+                bounds.add(lo)
+            if start < hi < end:
+                bounds.add(hi)
+    ordered_rules = sorted(rules)
+    for eff, _ in ordered_rules:
+        if start < eff < end:
+            bounds.add(eff)
+    cuts = sorted(bounds)
+
+    effs = [eff for eff, _ in ordered_rules]
+    caps = [cap for _, cap in ordered_rules]
+
+    def capacity_at(t: float) -> int | None:
+        i = bisect.bisect_right(effs, t) - 1
+        return caps[i] if i >= 0 else None
+
+    segments: list[OccupancySegment] = []
+    for lo, hi in zip(cuts, cuts[1:]):
+        devices = tuple(sorted(
+            d for d, ivs in intervals.items()
+            if any(a <= lo < b for a, b in ivs)
+        ))
+        capacity = capacity_at(lo)
+        if segments and segments[-1].capacity == capacity and segments[-1].devices == devices:
+            segments[-1].end = hi  # 状态未变，延长当前分段
+        else:
+            segments.append(OccupancySegment(lo, hi, capacity, devices))
+    return segments
